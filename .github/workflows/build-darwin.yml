@@ -1,0 +1,139 @@
+# Reusable: macOS release build (GitHub-hosted macOS runners).
+# Invoked from build.yml only (workflow_call).
+
+name: MacOS build job
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        required: true
+        type: string
+      target_id:
+        required: true
+        type: string
+      runs_on:
+        required: true
+        type: string
+      os:
+        required: true
+        type: string
+      arch:
+        required: true
+        type: string
+      baseline:
+        required: true
+        type: boolean
+      artifact_triplet:
+        required: true
+        type: string
+      release_suffix:
+        required: true
+        type: string
+      github_event_name:
+        required: true
+        type: string
+      github_ref_name:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: "${{ inputs.target_id }} (macOS)"
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - id: brew_paths
+        name: Homebrew cache path
+        run: echo "cache=$HOME/Library/Caches/Homebrew" >> "$GITHUB_OUTPUT"
+
+      # Speeds up brew install by reusing bottle downloads (runner image already has brew).
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.brew_paths.outputs.cache }}
+          key: gha-homebrew-${{ runner.arch }}-v1
+          save-always: true
+
+      - name: Install Homebrew dependencies
+        run: |
+          set -euo pipefail
+          for pkg in llvm@21 automake ccache cmake coreutils gnu-sed go icu4c libiconv libtool ninja pkg-config rust ruby; do
+            if brew list --formula "$pkg" &>/dev/null; then
+              echo "brew: $pkg already installed, skip"
+            else
+              brew install "$pkg"
+            fi
+          done
+
+      - name: LLVM on PATH
+        run: echo "$(brew --prefix llvm@21)/bin" >> "${GITHUB_PATH}"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Key is derived from scripts under the build ref (checkout_ref), not the workflow branch.
+      - name: Cache Bun build deps (WebKit, headers, ccache)
+        uses: actions/cache@v4
+        with:
+          path: build/gha-${{ inputs.target_id }}/cache
+          key: bun-build-cache-${{ inputs.target_id }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build/deps/**/*.ts', 'scripts/build/zig.ts') }}
+          save-always: true
+
+      - name: Build
+        env:
+          CI: "true"
+          BASELINE_FLAG: ${{ inputs.baseline == true && '--baseline=true' || '' }}
+        run: |
+          set -euxo pipefail
+          bun --version
+          _ninja_j="$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
+          bun scripts/build.ts \
+            --profile=release \
+            --ci=true \
+            --lto=true \
+            --os="${{ inputs.os }}" \
+            --arch="${{ inputs.arch }}" \
+            ${BASELINE_FLAG} \
+            --build-dir="build/gha-${{ inputs.target_id }}" \
+            -- \
+            -j"${_ninja_j}"
+
+      - name: Package (tar.gz)
+        id: pack
+        env:
+          BUN_RELEASE_SUFFIX: ${{ inputs.release_suffix }}
+        run: |
+          set -euxo pipefail
+          test -x "build/gha-${{ inputs.target_id }}/bun"
+          mkdir -p dist
+          cp "build/gha-${{ inputs.target_id }}/bun" dist/bun
+          chmod +x dist/bun
+          ARCHIVE="${{ inputs.artifact_triplet }}-${BUN_RELEASE_SUFFIX}.tar.gz"
+          tar -czvf "${ARCHIVE}" -C dist bun
+          echo "archive=${ARCHIVE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload workflow artifact
+        if: inputs.github_event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.target_id }}-${{ inputs.github_ref_name }}
+          path: ${{ steps.pack.outputs.archive }}
+
+      - name: Stage package for GitHub Release (aggregated upload)
+        if: inputs.github_event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh-release-asset-${{ inputs.target_id }}
+          path: ${{ steps.pack.outputs.archive }}
+          retention-days: 2
+          if-no-files-found: error

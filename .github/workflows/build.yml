@@ -1,0 +1,241 @@
+# Fork-friendly release builds: pick official Bun platforms via workflow_dispatch,
+# or configure published releases with a repository variable.
+#
+# Triggers
+#   - workflow_dispatch: optional artifacts per target (see inputs). Optional git_ref is the
+#     branch/tag/SHA to compile; the plan job always checks out github.ref (the branch you
+#     pick under "Use workflow from") so .github/scripts/plan-build-targets.mjs exists even
+#     when git_ref points at a branch without those files.
+#   - release (published): always checks out the release tag (git_ref ignored); uses repository
+#     variable BUN_FORK_RELEASE_TARGETS (see below).
+#
+# Target ids (comma-separated, or use "all")
+#   linux-x64-gnu, linux-x64-gnu-baseline, linux-aarch64-gnu,
+#   darwin-x64, darwin-x64-baseline, darwin-aarch64,
+#   windows-x64, windows-x64-baseline, windows-aarch64
+#
+# Linux musl (*-musl*) is intentionally unsupported here: upstream builds those on Alpine.
+#
+# Repository variable (Settings → Secrets and variables → Actions → Variables)
+#   BUN_FORK_RELEASE_TARGETS — used when a release is published. Default in the planner
+#   script is linux-x64-gnu if unset. Set to "all" to build every id above.
+#
+# Layout
+#   - OS-specific steps live in reusable workflows (workflow_call):
+#       .github/workflows/build-linux-gnu.yml
+#       .github/workflows/build-darwin.yml
+#       .github/workflows/build-windows.yml
+#   - After `plan`, Linux / macOS / Windows jobs are siblings and run in parallel.
+#   - On `release` (published), each build uploads a short-lived Actions artifact; the
+#     `finalize-github-release` job downloads them all and runs a single action-gh-release
+#     so every binary attaches to the same GitHub Release (no parallel release races).
+#   - Reusable build jobs cache `build/gha-<target>/cache` (WebKit/headers downloads + ccache).
+#     The cache key hashes `scripts/build/deps/**/*.ts` and `scripts/build/zig.ts` from the
+#     *build checkout* (checkout_ref / release tag), not the branch selected under "Use workflow from"
+#     (Linux checks out the source into `bun-src/`, so those globs are prefixed there in the workflow).
+#   - Separate lightweight toolchain caches (Homebrew / Scoop download dirs, Linux CMake installer)
+#     use fixed keys (runner arch + version suffix). Bump the `v1` segment in those workflows if a
+#     cache ever goes stale after a runner image upgrade.
+#
+# Notes
+#   - Linux GNU reusable workflow runs inside the official Bun development container image
+#     (`ghcr.io/oven-sh/bun-development-docker-image:latest`) on normal GitHub-hosted
+#     Linux VMs. macOS and Windows jobs run natively on their host runners.
+#   - Not the upstream BuildKite split pipeline: profile=release, ci=true, lto=true,
+#     buildkite stays false (do not use profile=ci-release).
+#   - Builds are slow and RAM-heavy; use larger runners if linking fails.
+#   - This workflow only builds on public repositories. On private repos it exits
+#     before matrix builds so your private Actions minutes are not consumed.
+#   - windows-11-arm is only available on public repos; private orgs may need a different runner.
+#   - macOS Intel jobs use macos-13; Apple Silicon uses macos-14.
+
+name: Build (fork release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        type: string
+        description: >
+          Branch, tag, or SHA to compile (build jobs only). The plan step always uses the branch
+          selected under "Use workflow from" so .github/scripts/ stays available. Leave empty to
+          build the same ref as the workflow branch.
+        default: ""
+      build_all:
+        type: boolean
+        description: Build every official target (ignores targets list)
+        default: false
+      targets:
+        type: string
+        description: Comma-separated target ids, or "all" (when build_all is false)
+        default: "all"
+  release:
+    types: [published]
+
+# Reusable build workflows use upload-artifact (needs actions: write). Callers must grant it;
+# nested workflows cannot request broader token scope than the parent allows.
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  private-repo-guard:
+    name: Private repo guard
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.private == true }}
+    steps:
+      - name: Skip in private repositories
+        run: |
+          echo "This workflow is configured to run builds only on public repositories."
+          echo "Reason: avoid consuming private GitHub Actions minutes."
+          exit 0
+
+  plan:
+    name: Plan targets
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.private == false }}
+    outputs:
+      checkout_ref: ${{ steps.resolve_build_ref.outputs.ref }}
+      linux_gnu_count: ${{ steps.run.outputs.linux_gnu_count }}
+      darwin_count: ${{ steps.run.outputs.darwin_count }}
+      windows_count: ${{ steps.run.outputs.windows_count }}
+      linux_gnu_matrix: ${{ steps.run.outputs.linux_gnu_matrix }}
+      darwin_matrix: ${{ steps.run.outputs.darwin_matrix }}
+      windows_matrix: ${{ steps.run.outputs.windows_matrix }}
+    env:
+      INPUT_BUILD_ALL: ${{ github.event_name == 'workflow_dispatch' && inputs.build_all || false }}
+      INPUT_TARGETS: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || '' }}
+      BUN_FORK_RELEASE_TARGETS: ${{ vars.BUN_FORK_RELEASE_TARGETS }}
+    steps:
+      # Source ref for compile jobs only (see checkout_ref output). Plan uses github.ref below.
+      - id: resolve_build_ref
+        name: Resolve build checkout ref
+        run: echo "ref=${BUILD_REF}" >> "${GITHUB_OUTPUT}"
+        env:
+          BUILD_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.git_ref != '' && inputs.git_ref || github.ref }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - id: run
+        name: Compute matrices
+        run: node .github/scripts/plan-build-targets.mjs
+
+  # release_suffix: workflow-level env is unavailable in job.with for reusable workflows; keep this expression in sync across OS jobs.
+  build-linux-gnu:
+    name: "${{ matrix.id }} (Linux GNU)"
+    needs: plan
+    if: ${{ github.event.repository.private == false && needs.plan.outputs.linux_gnu_count != '0' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.linux_gnu_matrix) }}
+    uses: ./.github/workflows/build-linux-gnu.yml
+    secrets: inherit
+    with:
+      checkout_ref: ${{ needs.plan.outputs.checkout_ref }}
+      workflow_ref: ${{ github.ref }}
+      target_id: ${{ matrix.id }}
+      runs_on: ${{ matrix.runs_on }}
+      os: ${{ matrix.os }}
+      arch: ${{ matrix.arch }}
+      abi: ${{ matrix.abi }}
+      baseline: ${{ matrix.baseline }}
+      artifact_triplet: ${{ matrix.artifact_triplet }}
+      release_suffix: ${{ github.event_name == 'release' && github.ref_name || format('{0}-{1}', github.ref_name, github.sha) }}
+      github_event_name: ${{ github.event_name }}
+      github_ref_name: ${{ github.ref_name }}
+
+  build-darwin:
+    name: "${{ matrix.id }} (macOS)"
+    needs: plan
+    if: ${{ github.event.repository.private == false && needs.plan.outputs.darwin_count != '0' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.darwin_matrix) }}
+    uses: ./.github/workflows/build-darwin.yml
+    secrets: inherit
+    with:
+      checkout_ref: ${{ needs.plan.outputs.checkout_ref }}
+      target_id: ${{ matrix.id }}
+      runs_on: ${{ matrix.runs_on }}
+      os: ${{ matrix.os }}
+      arch: ${{ matrix.arch }}
+      baseline: ${{ matrix.baseline }}
+      artifact_triplet: ${{ matrix.artifact_triplet }}
+      release_suffix: ${{ github.event_name == 'release' && github.ref_name || format('{0}-{1}', github.ref_name, github.sha) }}
+      github_event_name: ${{ github.event_name }}
+      github_ref_name: ${{ github.ref_name }}
+
+  build-windows:
+    name: "${{ matrix.id }} (Windows)"
+    needs: plan
+    if: ${{ github.event.repository.private == false && needs.plan.outputs.windows_count != '0' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.windows_matrix) }}
+    uses: ./.github/workflows/build-windows.yml
+    secrets: inherit
+    with:
+      checkout_ref: ${{ needs.plan.outputs.checkout_ref }}
+      target_id: ${{ matrix.id }}
+      runs_on: ${{ matrix.runs_on }}
+      os: ${{ matrix.os }}
+      arch: ${{ matrix.arch }}
+      baseline: ${{ matrix.baseline }}
+      artifact_triplet: ${{ matrix.artifact_triplet }}
+      release_suffix: ${{ github.event_name == 'release' && github.ref_name || format('{0}-{1}', github.ref_name, github.sha) }}
+      github_event_name: ${{ github.event_name }}
+      github_ref_name: ${{ github.ref_name }}
+
+  finalize-github-release:
+    name: Attach all packages to GitHub Release
+    runs-on: ubuntu-latest
+    needs: [plan, build-linux-gnu, build-darwin, build-windows]
+    if: >
+      always() &&
+      github.event_name == 'release' &&
+      github.event.repository.private == false &&
+      needs.plan.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Download staged release packages
+        id: dl
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gh-release-asset-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Count downloaded files
+        id: count
+        run: |
+          set -euo pipefail
+          n="$(find release-assets -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+
+      - name: Upload all assets to the published release
+        if: steps.count.outputs.count != '0'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: No release assets to upload
+        if: steps.count.outputs.count == '0'
+        run: |
+          echo "download-artifact step outcome: ${{ steps.dl.outcome }}"
+          echo "No files under release-assets/. Expected gh-release-asset-* artifacts from build jobs."
+          echo "If builds succeeded but this failed, check whether artifacts attach to this workflow run (reusable workflow runs)."
+          exit 1

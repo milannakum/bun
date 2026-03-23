@@ -1,0 +1,177 @@
+# Reusable: Linux GNU release build (GitHub-hosted Ubuntu + Bun dev container).
+# Invoked from build.yml only (workflow_call).
+
+name: Linux GNU build job
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        required: true
+        type: string
+      target_id:
+        required: true
+        type: string
+      runs_on:
+        required: true
+        type: string
+      os:
+        required: true
+        type: string
+      arch:
+        required: true
+        type: string
+      abi:
+        required: true
+        type: string
+      baseline:
+        required: true
+        type: boolean
+      artifact_triplet:
+        required: true
+        type: string
+      release_suffix:
+        required: true
+        type: string
+      github_event_name:
+        required: true
+        type: string
+      github_ref_name:
+        required: true
+        type: string
+      # Ref that contains CI helper scripts (.github/scripts). Kept as a stable source for
+      # workflow helpers even when checkout_ref points at an older SHA/branch.
+      workflow_ref:
+        required: true
+        type: string
+      container_image:
+        required: false
+        type: string
+        default: ghcr.io/oven-sh/bun-development-docker-image:latest
+
+# Release assets are staged as Actions artifacts; build.yml uploads them in one step.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: "${{ inputs.target_id }} (Linux GNU)"
+    runs-on: ${{ inputs.runs_on }}
+    container:
+      image: ${{ inputs.container_image }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        working-directory: bun-src
+    steps:
+      - name: Checkout source (build ref)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+          path: bun-src
+
+      - name: Checkout CI helpers (workflow ref)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.workflow_ref }}
+          path: bun-ci
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Prepare PATH (prefer container Bun)
+        run: |
+          set -euxo pipefail
+          # Dockerfile prepends /workspace/bun/build/{debug,release}; this checkout lives in bun-src.
+          _path="$PATH"
+          _path="${_path//\/workspace\/bun\/build\/debug:/}"
+          _path="${_path//\/workspace\/bun\/build\/release:/}"
+          export PATH="/usr/local/bin:/usr/local/bun/bin:$_path"
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          command -v bun
+          bun --version
+
+      - name: Cache bootstrap toolchain (cargo/rustup)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup
+          key: gha-linux-bootstrap-${{ runner.arch }}-${{ hashFiles('bun-src/scripts/bootstrap.sh') }}-v1
+          restore-keys: |
+            gha-linux-bootstrap-${{ runner.arch }}-
+          save-always: true
+
+      - name: Bootstrap dependencies from checked-out source
+        run: |
+          set -euxo pipefail
+          chmod +x scripts/bootstrap.sh
+          ./scripts/bootstrap.sh
+
+      # Bun stores downloads + ccache under build/<target>/cache (see scripts/build/config.ts).
+      # hashFiles(...) is evaluated from the checked-out tree under bun-src = inputs.checkout_ref,
+      # so bumps on the workflow branch do not affect the key unless the build ref matches them.
+      - name: Cache Bun build deps (WebKit, headers, ccache)
+        uses: actions/cache@v4
+        with:
+          path: bun-src/build/gha-${{ inputs.target_id }}/cache
+          key: bun-build-cache-${{ inputs.target_id }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun-src/scripts/build/deps/**/*.ts', 'bun-src/scripts/build/zig.ts') }}
+          save-always: true
+
+      - name: Build
+        env:
+          CI: "true"
+          BASELINE_FLAG: ${{ inputs.baseline == true && '--baseline=true' || '' }}
+        run: |
+          set -euxo pipefail
+          bun --version
+          # Omit --ci=true here on purpose: with cfg.ci + full (non-cpp-only) builds the
+          # ninja pipeline disables PCH on Linux, and Clang then errors on JSC's
+          # JSUint8Array::s_info under -Werror (-Wundefined-var-template). PCH stays on
+          # when cfg.ci is false. Keep CI=true in env for scripts/build CI logging/groups;
+          # cfg.ci is only the CLI flag. LTO remains explicit below.
+          # Match vCPU count (ubuntu-* runners: 4). Old -j2 left half the machine idle; LTO
+          # codegen is still parallel across targets. Final link stays mostly single-threaded.
+          _ninja_j="$(nproc)"
+          bun scripts/build.ts \
+            --profile=release \
+            --lto=true \
+            --os="${{ inputs.os }}" \
+            --arch="${{ inputs.arch }}" \
+            --abi="${{ inputs.abi }}" \
+            ${BASELINE_FLAG} \
+            --build-dir="build/gha-${{ inputs.target_id }}" \
+            -- \
+            -j"${_ninja_j}"
+
+      - name: Package (tar.gz)
+        id: pack
+        env:
+          BUN_RELEASE_SUFFIX: ${{ inputs.release_suffix }}
+        run: |
+          set -euxo pipefail
+          test -x "build/gha-${{ inputs.target_id }}/bun"
+          mkdir -p dist
+          cp "build/gha-${{ inputs.target_id }}/bun" dist/bun
+          chmod +x dist/bun
+          ARCHIVE="${{ inputs.artifact_triplet }}-${BUN_RELEASE_SUFFIX}.tar.gz"
+          tar -czvf "${ARCHIVE}" -C dist bun
+          echo "archive=bun-src/${ARCHIVE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload workflow artifact
+        if: inputs.github_event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.target_id }}-${{ inputs.github_ref_name }}
+          path: ${{ steps.pack.outputs.archive }}
+
+      - name: Stage package for GitHub Release (aggregated upload)
+        if: inputs.github_event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh-release-asset-${{ inputs.target_id }}
+          path: ${{ steps.pack.outputs.archive }}
+          retention-days: 2
+          if-no-files-found: error

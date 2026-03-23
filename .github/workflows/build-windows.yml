@@ -1,0 +1,175 @@
+# Reusable: Windows release build (GitHub-hosted Windows runners).
+# Invoked from build.yml only (workflow_call).
+
+name: Windows build job
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        required: true
+        type: string
+      target_id:
+        required: true
+        type: string
+      runs_on:
+        required: true
+        type: string
+      os:
+        required: true
+        type: string
+      arch:
+        required: true
+        type: string
+      baseline:
+        required: true
+        type: boolean
+      artifact_triplet:
+        required: true
+        type: string
+      release_suffix:
+        required: true
+        type: string
+      github_event_name:
+        required: true
+        type: string
+      github_ref_name:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: "${{ inputs.target_id }} (Windows)"
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      BUN_RELEASE_SUFFIX: ${{ inputs.release_suffix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - id: scoop_dl_cache
+        name: Scoop cache path
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:USERPROFILE "scoop\cache"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "path=$dir"
+
+      - name: Cache Scoop downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.scoop_dl_cache.outputs.path }}
+          key: gha-scoop-${{ runner.arch }}-v1
+          save-always: true
+
+      - name: Install Scoop toolchain (x64)
+        if: inputs.arch == 'x64'
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
+            irm get.scoop.sh | iex
+          }
+          $shim = Join-Path (Resolve-Path ~).Path "scoop\shims"
+          Add-Content -Path $env:GITHUB_PATH -Value $shim
+          scoop install cmake ninja nodejs-lts go rust nasm ruby perl
+          scoop install llvm@21.1.8
+
+      - name: Install LLVM (Windows ARM64)
+        if: inputs.arch == 'aarch64'
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
+            irm get.scoop.sh | iex
+          }
+          $shim = Join-Path (Resolve-Path ~).Path "scoop\shims"
+          Add-Content -Path $env:GITHUB_PATH -Value $shim
+          scoop install cmake ninja nodejs-lts go rust nasm ruby perl
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path (Join-Path $llvmBin "clang.exe"))) {
+            $llvm = "$env:TEMP\LLVM-21.1.8-woa64.exe"
+            Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/LLVM-21.1.8-woa64.exe" -OutFile $llvm
+            Start-Process -FilePath $llvm -ArgumentList "/S" -Wait
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
+
+      - name: Install Bun
+        run: |
+          irm bun.sh/install.ps1 | iex
+          $bunBin = Join-Path (Resolve-Path ~).Path ".bun\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $bunBin
+
+      # Key is derived from scripts under the build ref (checkout_ref), not the workflow branch.
+      - name: Cache Bun build deps (WebKit, headers, ccache)
+        uses: actions/cache@v4
+        with:
+          path: build/gha-${{ inputs.target_id }}/cache
+          key: bun-build-cache-${{ inputs.target_id }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build/deps/**/*.ts', 'scripts/build/zig.ts') }}
+          save-always: true
+
+      - name: Build
+        env:
+          CI: "true"
+        run: |
+          $j = 4
+          try { $j = [int]$env:NUMBER_OF_PROCESSORS } catch { }
+          if ($j -lt 1) { $j = 2 }
+          $args = @(
+            "scripts/build.ts",
+            "--profile=release",
+            "--ci=true",
+            "--lto=true",
+            "--os=${{ inputs.os }}",
+            "--arch=${{ inputs.arch }}",
+            "--build-dir=build/gha-${{ inputs.target_id }}",
+            "--",
+            "-j$j"
+          )
+          if ('${{ inputs.baseline }}' -eq 'true') {
+            $args = @(
+              "scripts/build.ts",
+              "--profile=release",
+              "--ci=true",
+              "--lto=true",
+              "--os=${{ inputs.os }}",
+              "--arch=${{ inputs.arch }}",
+              "--baseline=true",
+              "--build-dir=build/gha-${{ inputs.target_id }}",
+              "--",
+              "-j$j"
+            )
+          }
+          & bun @args
+
+      - name: Package (zip)
+        id: pack
+        run: |
+          $dir = "build/gha-${{ inputs.target_id }}"
+          $exe = Join-Path $dir "bun.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $name = "${{ inputs.artifact_triplet }}-$env:BUN_RELEASE_SUFFIX.zip"
+          Compress-Archive -LiteralPath $exe -DestinationPath $name -Force
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "archive=$name"
+
+      - name: Upload workflow artifact
+        if: inputs.github_event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.target_id }}-${{ inputs.github_ref_name }}
+          path: ${{ steps.pack.outputs.archive }}
+
+      - name: Stage package for GitHub Release (aggregated upload)
+        if: inputs.github_event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh-release-asset-${{ inputs.target_id }}
+          path: ${{ steps.pack.outputs.archive }}
+          retention-days: 2
+          if-no-files-found: error
