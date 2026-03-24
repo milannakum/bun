@@ -1,0 +1,91 @@
+workflows:
+  version: 2.1
+
+  build-linux-x64-gnu:
+    when:
+      and:
+        - equal: [true, << pipeline.parameters.run_pipeline >>]
+        - equal: [true, << pipeline.parameters.run_linux_x64_gnu >>]
+    jobs:
+      - build_linux_gnu:
+          name: linux-x64-gnu
+          target: linux-x64-gnu
+          build_ref: << pipeline.parameters.build_ref >>
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              only: /.*/
+
+  build-linux-x64-gnu-baseline:
+    when:
+      and:
+        - equal: [true, << pipeline.parameters.run_pipeline >>]
+        - equal: [true, << pipeline.parameters.run_linux_x64_gnu_baseline >>]
+    jobs:
+      - build_linux_gnu:
+          name: linux-x64-gnu-baseline
+          target: linux-x64-gnu-baseline
+          build_ref: << pipeline.parameters.build_ref >>
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              only: /.*/
+
+  build-darwin-aarch64:
+    when:
+      and:
+        - equal: [true, << pipeline.parameters.run_pipeline >>]
+        - equal: [true, << pipeline.parameters.run_macos_build >>]
+    jobs:
+      - build_macos_arm64:
+          name: darwin-aarch64
+          target: darwin-aarch64
+          build_ref: << pipeline.parameters.build_ref >>
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              only: /.*/
+
+  publish-with-darwin:
+    when:
+      and:
+        - equal: [true, << pipeline.parameters.run_pipeline >>]
+        - equal: [true, << pipeline.parameters.upload_github_release >>]
+        - equal: [true, << pipeline.parameters.run_linux_x64_gnu >>]
+        - equal: [true, << pipeline.parameters.run_linux_x64_gnu_baseline >>]
+        - equal: [true, << pipeline.parameters.run_macos_build >>]
+    jobs:
+      - publish_github_release:
+          name: publish-github-release-with-darwin
+          requires:
+            - linux-x64-gnu
+            - linux-x64-gnu-baseline
+            - darwin-aarch64
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /.*/
+
+  publish-linux-only:
+    when:
+      and:
+        - equal: [true, << pipeline.parameters.run_pipeline >>]
+        - equal: [true, << pipeline.parameters.upload_github_release >>]
+        - equal: [true, << pipeline.parameters.run_linux_x64_gnu >>]
+        - equal: [true, << pipeline.parameters.run_linux_x64_gnu_baseline >>]
+        - equal: [false, << pipeline.parameters.run_macos_build >>]
+    jobs:
+      - publish_github_release:
+          name: publish-github-release-linux-only
+          requires:
+            - linux-x64-gnu
+            - linux-x64-gnu-baseline
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /.*/

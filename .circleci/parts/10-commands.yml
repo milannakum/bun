@@ -1,0 +1,75 @@
+commands:
+  checkout_build_ref:
+    parameters:
+      build_ref:
+        type: string
+    steps:
+      - checkout
+      - run:
+          name: Checkout requested build ref
+          command: |
+            set -euxo pipefail
+            if [ -n "<< parameters.build_ref >>" ]; then
+              fetch_url="${CIRCLE_REPOSITORY_URL:-$(git remote get-url origin)}"
+              # Docker images may not include ssh client; prefer https transport for fetch.
+              case "$fetch_url" in
+                git@github.com:*)
+                  fetch_url="https://github.com/${fetch_url#git@github.com:}"
+                  ;;
+                ssh://git@github.com/*)
+                  fetch_url="https://github.com/${fetch_url#ssh://git@github.com/}"
+                  ;;
+              esac
+              git fetch --tags --force "$fetch_url" "<< parameters.build_ref >>"
+              git checkout --force FETCH_HEAD
+            fi
+
+  install_bun_unix:
+    steps:
+      - run:
+          name: Install Bun
+          command: |
+            set -euxo pipefail
+            if [ -x "$HOME/.bun/bin/bun" ]; then
+              echo "Bun already present (restored from cache)"
+            else
+              curl -fsSL https://bun.sh/install | bash
+            fi
+            echo 'export PATH="$HOME/.bun/bin:$PATH"' >> "$BASH_ENV"
+
+  compute_target_flags:
+    parameters:
+      target:
+        type: string
+    steps:
+      - run:
+          name: Compute build flags
+          command: |
+            set -euxo pipefail
+            case "<< parameters.target >>" in
+              linux-x64-gnu)
+                echo 'export BUILD_OS="linux"' >> "$BASH_ENV"
+                echo 'export BUILD_ARCH="x64"' >> "$BASH_ENV"
+                echo 'export BUILD_ABI="gnu"' >> "$BASH_ENV"
+                echo 'export BUILD_BASELINE=""' >> "$BASH_ENV"
+                echo 'export ARTIFACT_TRIPLET="bun-linux-x64"' >> "$BASH_ENV"
+                ;;
+              linux-x64-gnu-baseline)
+                echo 'export BUILD_OS="linux"' >> "$BASH_ENV"
+                echo 'export BUILD_ARCH="x64"' >> "$BASH_ENV"
+                echo 'export BUILD_ABI="gnu"' >> "$BASH_ENV"
+                echo 'export BUILD_BASELINE="--baseline=true"' >> "$BASH_ENV"
+                echo 'export ARTIFACT_TRIPLET="bun-linux-x64-baseline"' >> "$BASH_ENV"
+                ;;
+              darwin-aarch64)
+                echo 'export BUILD_OS="darwin"' >> "$BASH_ENV"
+                echo 'export BUILD_ARCH="aarch64"' >> "$BASH_ENV"
+                echo 'export BUILD_BASELINE=""' >> "$BASH_ENV"
+                echo 'export ARTIFACT_TRIPLET="bun-darwin-aarch64"' >> "$BASH_ENV"
+                ;;
+              *)
+                echo "Unknown target: << parameters.target >>" >&2
+                exit 1
+                ;;
+            esac
+            echo 'export BUILD_DIR="build/circleci-<< parameters.target >>"' >> "$BASH_ENV"

@@ -1,0 +1,113 @@
+build_linux_gnu:
+  docker:
+    # Official Bun *development* image (not `oven/bun` app runtime). Base `:latest` only —
+    # `:prebuilt` / `:run` set ENTRYPOINT to bun-debug and break normal CI steps.
+    # https://github.com/oven-sh/bun-development-docker-image
+    - image: ghcr.io/oven-sh/bun-development-docker-image:latest
+  # Docker executor is typically the most Free-plan-friendly Linux option.
+  resource_class: medium
+  parameters:
+    target:
+      type: enum
+      enum: ["linux-x64-gnu", "linux-x64-gnu-baseline"]
+    build_ref:
+      type: string
+      default: ""
+  environment:
+    CI: "true"
+  steps:
+    - checkout_build_ref:
+        build_ref: << parameters.build_ref >>
+    - run:
+        name: Prepare PATH (avoid image clone under /workspace/bun)
+        command: |
+          set -euxo pipefail
+          git config --global --add safe.directory "$(pwd)"
+          # Dockerfile prepends /workspace/bun/build/{debug,release}; CircleCI checks out elsewhere.
+          _path="$PATH"
+          _path="${_path//\/workspace\/bun\/build\/debug:/}"
+          _path="${_path//\/workspace\/bun\/build\/release:/}"
+          export PATH="/usr/local/bin:/usr/local/bun/bin:$_path"
+          echo "export PATH=\"$PATH\"" >> "$BASH_ENV"
+          command -v bun
+          bun --version
+    - restore_cache:
+        keys:
+          - linux-bootstrap-v1-{{ arch }}-{{ checksum "scripts/bootstrap.sh" }}
+    - run:
+        name: Bootstrap (scripts/bootstrap.sh)
+        no_output_timeout: 45m
+        command: |
+          set -euxo pipefail
+          # BASH_ENV is created by CircleCI; source when present.
+          if [ -f "${BASH_ENV:-}" ]; then
+            # shellcheck disable=SC1090
+            source "$BASH_ENV"
+          fi
+          chmod +x scripts/bootstrap.sh
+          ./scripts/bootstrap.sh
+    - save_cache:
+        key: linux-bootstrap-v1-{{ arch }}-{{ checksum "scripts/bootstrap.sh" }}
+        paths:
+          - ~/.cargo/registry
+          - ~/.cargo/git
+          - ~/.rustup
+    - compute_target_flags:
+        target: << parameters.target >>
+    - restore_cache:
+        keys:
+          - bun-build-cache-linux-v2-{{ arch }}-{{ checksum "bun.lock" }}-{{ checksum "scripts/build/deps/webkit.ts" }}-{{ checksum "scripts/build/deps/nodejs-headers.ts" }}-{{ checksum "scripts/build/zig.ts" }}-{{ checksum "scripts/build/deps/boringssl.ts" }}-{{ checksum "scripts/build/deps/libarchive.ts" }}
+          - bun-build-cache-linux-v2-{{ arch }}-{{ checksum "bun.lock" }}-
+          - bun-build-cache-linux-v2-{{ arch }}-
+    - run:
+        name: Build
+        # LTO link can go a long time without ninja line output; CircleCI's default no-output limit is short.
+        no_output_timeout: 3h
+        command: |
+          set -euxo pipefail
+          if [ -f "${BASH_ENV:-}" ]; then
+            # shellcheck disable=SC1090
+            source "$BASH_ENV"
+          fi
+          bun --version
+          bun scripts/build.ts \
+            --profile=release \
+            --lto=true \
+            --os="$BUILD_OS" \
+            --arch="$BUILD_ARCH" \
+            --abi="$BUILD_ABI" \
+            ${BUILD_BASELINE} \
+            --build-dir="$BUILD_DIR" \
+            -- \
+            -j"$(nproc)"
+    - save_cache:
+        key: bun-build-cache-linux-v2-{{ arch }}-{{ checksum "bun.lock" }}-{{ checksum "scripts/build/deps/webkit.ts" }}-{{ checksum "scripts/build/deps/nodejs-headers.ts" }}-{{ checksum "scripts/build/zig.ts" }}-{{ checksum "scripts/build/deps/boringssl.ts" }}-{{ checksum "scripts/build/deps/libarchive.ts" }}
+        paths:
+          - build/circleci-<< parameters.target >>/cache
+    - run:
+        name: Package
+        command: |
+          set -euxo pipefail
+          if [ -f "${BASH_ENV:-}" ]; then
+            # shellcheck disable=SC1090
+            source "$BASH_ENV"
+          fi
+          test -x "$BUILD_DIR/bun"
+          mkdir -p dist
+          cp "$BUILD_DIR/bun" dist/bun
+          chmod +x dist/bun
+          if [ -n "${CIRCLE_TAG:-}" ]; then
+            suffix="$CIRCLE_TAG"
+          else
+            suffix="${CIRCLE_BRANCH:-local}-${CIRCLE_SHA1}"
+          fi
+          archive="${ARTIFACT_TRIPLET}-${suffix}.tar.gz"
+          tar -czvf "$archive" -C dist bun
+          mkdir -p out
+          mv "$archive" out/
+    - persist_to_workspace:
+        root: .
+        paths:
+          - out
+    - store_artifacts:
+        path: out

@@ -1,0 +1,24 @@
+# Assembled into merged-config.yml by assemble-config.sh (do not edit merged file).
+version: 2.1
+
+parameters:
+  # Manual trigger gate: keep false so push/tag pipelines do not build by default.
+  run_pipeline:
+    type: boolean
+    default: false
+  build_ref:
+    type: string
+    default: ""
+  upload_github_release:
+    type: boolean
+    default: false
+  run_linux_x64_gnu:
+    type: boolean
+    default: true
+  run_linux_x64_gnu_baseline:
+    type: boolean
+    default: false
+  # Free plan often has no hosted macOS; keep opt-in.
+  run_macos_build:
+    type: boolean
+    default: false

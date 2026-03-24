@@ -1,0 +1,97 @@
+build_macos_arm64:
+  macos:
+    xcode: "15.4.0"
+  # medium is available on more plans than large; upgrade to macos.m1.large.gen1 if you need more RAM/CPU.
+  resource_class: macos.m1.medium.gen1
+  parameters:
+    target:
+      type: enum
+      enum: ["darwin-aarch64"]
+    build_ref:
+      type: string
+      default: ""
+  environment:
+    CI: "true"
+  steps:
+    - checkout_build_ref:
+        build_ref: << parameters.build_ref >>
+    - restore_cache:
+        keys:
+          - macos-homebrew-v1-{{ arch }}
+    - run:
+        name: Install Homebrew dependencies
+        command: |
+          set -euxo pipefail
+          for pkg in llvm@21 automake ccache cmake coreutils gnu-sed go icu4c libiconv libtool ninja pkg-config rust ruby; do
+            if brew list --formula "$pkg" >/dev/null 2>&1; then
+              echo "brew: $pkg already installed"
+            else
+              brew install "$pkg"
+            fi
+          done
+          printf 'export PATH="%s:$PATH"\n' "$(brew --prefix llvm@21)/bin" >> "$BASH_ENV"
+    - save_cache:
+        key: macos-homebrew-v1-{{ arch }}
+        paths:
+          - ~/Library/Caches/Homebrew
+    - restore_cache:
+        keys:
+          - bun-install-ci-v1-{{ arch }}
+    - install_bun_unix
+    - save_cache:
+        key: bun-install-ci-v1-{{ arch }}
+        paths:
+          - ~/.bun
+    - compute_target_flags:
+        target: << parameters.target >>
+    - restore_cache:
+        keys:
+          - bun-build-cache-macos-v2-{{ arch }}-{{ checksum "bun.lock" }}-{{ checksum "scripts/build/deps/webkit.ts" }}-{{ checksum "scripts/build/deps/nodejs-headers.ts" }}-{{ checksum "scripts/build/zig.ts" }}-{{ checksum "scripts/build/deps/boringssl.ts" }}-{{ checksum "scripts/build/deps/libarchive.ts" }}
+          - bun-build-cache-macos-v2-{{ arch }}-{{ checksum "bun.lock" }}-
+          - bun-build-cache-macos-v2-{{ arch }}-
+    - run:
+        name: Build
+        no_output_timeout: 3h
+        command: |
+          set -euxo pipefail
+          source "$BASH_ENV"
+          j="$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
+          bun --version
+          bun scripts/build.ts \
+            --profile=release \
+            --ci=true \
+            --lto=true \
+            --os="$BUILD_OS" \
+            --arch="$BUILD_ARCH" \
+            ${BUILD_BASELINE} \
+            --build-dir="$BUILD_DIR" \
+            -- \
+            -j"$j"
+    - save_cache:
+        key: bun-build-cache-macos-v2-{{ arch }}-{{ checksum "bun.lock" }}-{{ checksum "scripts/build/deps/webkit.ts" }}-{{ checksum "scripts/build/deps/nodejs-headers.ts" }}-{{ checksum "scripts/build/zig.ts" }}-{{ checksum "scripts/build/deps/boringssl.ts" }}-{{ checksum "scripts/build/deps/libarchive.ts" }}
+        paths:
+          - build/circleci-<< parameters.target >>/cache
+    - run:
+        name: Package
+        command: |
+          set -euxo pipefail
+          source "$BASH_ENV"
+          test -x "$BUILD_DIR/bun"
+          mkdir -p dist
+          cp "$BUILD_DIR/bun" dist/bun
+          chmod +x dist/bun
+          if [ -n "${CIRCLE_TAG:-}" ]; then
+            suffix="$CIRCLE_TAG"
+          else
+            suffix="${CIRCLE_BRANCH:-local}-${CIRCLE_SHA1}"
+          fi
+          archive="${ARTIFACT_TRIPLET}-${suffix}.tar.gz"
+          tar -czvf "$archive" -C dist bun
+          mkdir -p out
+          mv "$archive" out/
+    - persist_to_workspace:
+        root: .
+        paths:
+          - out
+    - store_artifacts:
+        path: out

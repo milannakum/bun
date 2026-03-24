@@ -1,0 +1,32 @@
+publish_github_release:
+  docker:
+    - image: cimg/base:stable
+  steps:
+    - attach_workspace:
+        at: /tmp/workspace
+    - run:
+        name: Publish artifacts to GitHub Release
+        command: |
+          set -euxo pipefail
+          if [ "<< pipeline.parameters.upload_github_release >>" != "true" ]; then
+            echo "upload_github_release=false, skipping"
+            exit 0
+          fi
+          if [ -z "${CIRCLE_TAG:-}" ]; then
+            echo "Not a tag pipeline; nothing to release"
+            exit 0
+          fi
+          if [ -z "${GITHUB_TOKEN:-}" ]; then
+            echo "GITHUB_TOKEN is required for release upload" >&2
+            exit 1
+          fi
+          sudo apt-get update
+          sudo apt-get install -y gh
+          shopt -s nullglob
+          files=(/tmp/workspace/out/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No artifacts found in workspace"
+            exit 1
+          fi
+          repo="${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
+          gh release upload "$CIRCLE_TAG" "${files[@]}" --repo "$repo" --clobber

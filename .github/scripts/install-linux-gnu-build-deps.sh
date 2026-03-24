@@ -5,6 +5,18 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Optional: reuse apt archives + package lists between CI runs (CircleCI cache).
+# Set to a writable directory; script creates archives/ + lists/ and configures apt globally.
+if [[ -n "${BUN_APT_ARCHIVE_CACHE:-}" ]]; then
+  base="${BUN_APT_ARCHIVE_CACHE}"
+  mkdir -p "${base}/archives" "${base}/lists"
+  chmod 777 "${base}" "${base}/archives" "${base}/lists"
+  sudo tee /etc/apt/apt.conf.d/99-bun-ci-apt-cache.conf >/dev/null <<EOF
+Dir::Cache::archives "${base}/archives";
+Dir::State::lists "${base}/lists";
+EOF
+fi
+
 dpkg_ok() {
   dpkg -s "$1" &>/dev/null
 }
@@ -115,7 +127,19 @@ sudo ln -sf "/usr/bin/ld.lld" /usr/bin/ld
 sudo ln -sf /usr/bin/clang /usr/bin/cc
 sudo ln -sf /usr/bin/clang++ /usr/bin/c++
 
-echo "CC=clang" >> "${GITHUB_ENV}"
-echo "CXX=clang++" >> "${GITHUB_ENV}"
-echo "AR=llvm-ar-${LLVM_V}" >> "${GITHUB_ENV}"
-echo "RANLIB=llvm-ranlib-${LLVM_V}" >> "${GITHUB_ENV}"
+# GitHub Actions uses GITHUB_ENV; CircleCI and local shells use BASH_ENV when set.
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  {
+    echo "CC=clang"
+    echo "CXX=clang++"
+    echo "AR=llvm-ar-${LLVM_V}"
+    echo "RANLIB=llvm-ranlib-${LLVM_V}"
+  } >>"${GITHUB_ENV}"
+elif [[ -n "${BASH_ENV:-}" ]]; then
+  {
+    echo "export CC=clang"
+    echo "export CXX=clang++"
+    echo "export AR=llvm-ar-${LLVM_V}"
+    echo "export RANLIB=llvm-ranlib-${LLVM_V}"
+  } >>"${BASH_ENV}"
+fi

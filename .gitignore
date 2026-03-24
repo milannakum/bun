@@ -194,3 +194,5 @@ scripts/lldb-inline
 
 # We regenerate these in all the build scripts
 cmake/sources/*.txt
+
+.circleci/merged-config.yml
